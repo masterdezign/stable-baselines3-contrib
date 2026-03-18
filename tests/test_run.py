@@ -3,7 +3,7 @@ import pytest
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import VecNormalize
 
-from sb3_contrib import ARS, QRDQN, TQC, TRPO, CrossQ, MaskablePPO
+from sb3_contrib import ARS, QRDQN, TQC, TRPO, CrossQ, MaskablePPO, RecurrentSAC
 from sb3_contrib.common.envs import InvalidActionEnvDiscrete
 from sb3_contrib.common.vec_env import AsyncEval
 
@@ -155,6 +155,41 @@ def test_offpolicy_multi_env(model_class):
         train_freq=5,
     )
     model.learn(total_timesteps=150)
+
+
+@pytest.mark.parametrize("shared_state", [True, False])
+def test_recurrent_sac(shared_state):
+    model = RecurrentSAC(
+        "MlpLstmPolicy",
+        "Pendulum-v1",
+        buffer_size=300,
+        batch_size=4,
+        learning_starts=100,
+        segment_len=20,
+        overlap=5,
+        burn_in=5,
+        shared_state=shared_state,
+        policy_kwargs=dict(net_arch=[32], lstm_hidden_size=32),
+        verbose=0,
+    )
+    model.learn(total_timesteps=200)
+
+
+def test_recurrent_sac_multi_env():
+    env = make_vec_env("Pendulum-v1", n_envs=2)
+    model = RecurrentSAC(
+        "MlpLstmPolicy",
+        env,
+        buffer_size=300,
+        batch_size=4,
+        learning_starts=100,
+        segment_len=20,
+        overlap=5,
+        burn_in=5,
+        policy_kwargs=dict(net_arch=[32], lstm_hidden_size=32),
+        verbose=0,
+    )
+    model.learn(total_timesteps=200)
 
 
 @pytest.mark.parametrize("normalize_advantage", [False, True])
