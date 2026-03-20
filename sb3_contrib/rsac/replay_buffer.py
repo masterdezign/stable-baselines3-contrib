@@ -189,6 +189,9 @@ class RecurrentReplayBuffer(BaseBuffer):
 
         actions = self.actions[batch_inds]  # (B, T, act_dim)
         rewards = self.rewards[batch_inds]  # (B, T, 1)
+        if env is not None:
+            B, T = rewards.shape[:2]
+            rewards = self._normalize_reward(rewards.reshape(B * T, 1), env).reshape(B, T, 1)
         dones = self.dones[batch_inds]  # (B, T, 1)
         mask = self.mask[batch_inds]  # (B, T, 1)
 

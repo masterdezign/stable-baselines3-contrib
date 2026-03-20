@@ -218,6 +218,29 @@ class RecurrentActor(BasePolicy):
         actions, log_prob = self.action_dist.log_prob_from_params(mean, log_std, **kwargs)
         return actions, log_prob, new_states
 
+    def get_lstm_latent(
+        self,
+        obs: PyTorchObs,
+        lstm_states: tuple[th.Tensor, th.Tensor],
+        episode_starts: th.Tensor,
+    ) -> tuple[th.Tensor, tuple[th.Tensor, th.Tensor]]:
+        """Run features extractor + LSTM only; return raw LSTM output before the MLP heads."""
+        features = self.extract_features(obs, self.features_extractor)
+        lstm_out, new_states = _process_sequence(features, lstm_states, episode_starts, self.lstm)
+        return lstm_out, new_states
+
+    def actions_log_prob_from_latent(
+        self,
+        lstm_out: th.Tensor,
+    ) -> tuple[th.Tensor, th.Tensor]:
+        """Apply MLP heads to precomputed LSTM output; return (squashed actions, log_prob)."""
+        latent_pi = self.latent_pi(lstm_out)
+        mean_actions = self.mu(latent_pi)
+        if self.use_sde:
+            return self.action_dist.log_prob_from_params(mean_actions, self.log_std, latent_sde=latent_pi)
+        log_std = th.clamp(self.log_std(latent_pi), LOG_STD_MIN, LOG_STD_MAX)  # type: ignore[operator]
+        return self.action_dist.log_prob_from_params(mean_actions, log_std)
+
     def _predict(
         self,
         observation: PyTorchObs,
@@ -325,10 +348,14 @@ class RecurrentCritic(BaseModel):
         self.lstm_hidden_size = lstm_hidden_size
         self.n_lstm_layers = n_lstm_layers
 
+        # When shared_state=False each Q-head gets its own independent LSTM (matching the
+        # reference offpcc implementation where Q1_summarizer and Q2_summarizer are separate).
         if not shared_state:
-            self.lstm = nn.LSTM(features_dim, lstm_hidden_size, num_layers=n_lstm_layers)
+            self.lstm_list = nn.ModuleList(
+                [nn.LSTM(features_dim, lstm_hidden_size, num_layers=n_lstm_layers) for _ in range(n_critics)]
+            )
         else:
-            self.lstm = None  # type: ignore[assignment]
+            self.lstm_list = None  # type: ignore[assignment]
 
         critic_input_dim = lstm_hidden_size + action_dim
         self.q_networks: list[nn.Module] = []
@@ -354,17 +381,19 @@ class RecurrentCritic(BaseModel):
         :param episode_starts: (n_seq*T,) — required when not shared_state.
         :return: (tuple of Q-value tensors each (n_seq*T, 1), new_lstm_states or None).
         """
-        new_lstm_states: tuple[Any, Any] | None
-        if self.lstm is not None and lstm_states is not None and episode_starts is not None:
+        if self.lstm_list is not None and lstm_states is not None and episode_starts is not None:
+            # Non-shared case: each Q-head runs through its own independent LSTM.
             features = self.extract_features(obs_or_latent, self.features_extractor)
-            latent, new_lstm_states = _process_sequence(features, lstm_states, episode_starts, self.lstm)
+            q_values = tuple(
+                qf(th.cat([_process_sequence(features, lstm_states, episode_starts, lstm_i)[0], actions], dim=-1))
+                for qf, lstm_i in zip(self.q_networks, self.lstm_list)
+            )
+            return q_values, None
         else:
-            latent = obs_or_latent
-            new_lstm_states = lstm_states
-
-        qvalue_input = th.cat([latent, actions], dim=-1)
-        q_values = tuple(qf(qvalue_input) for qf in self.q_networks)
-        return q_values, new_lstm_states
+            # Shared-state case: actor LSTM output passed directly as latent.
+            qvalue_input = th.cat([obs_or_latent, actions], dim=-1)
+            q_values = tuple(qf(qvalue_input) for qf in self.q_networks)
+            return q_values, lstm_states
 
 
 class RecurrentSACPolicy(BasePolicy):
