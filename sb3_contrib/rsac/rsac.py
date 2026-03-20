@@ -11,6 +11,7 @@ from stable_baselines3.common.policies import BasePolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, RolloutReturn, Schedule, TrainFreq
 from stable_baselines3.common.utils import polyak_update, should_collect_more_steps
 from stable_baselines3.common.vec_env import VecEnv
+from torch import nn
 
 from sb3_contrib.rsac.policies import CnnLstmPolicy, MlpLstmPolicy, MultiInputLstmPolicy, RecurrentSACPolicy
 from sb3_contrib.rsac.replay_buffer import RecurrentReplayBuffer
@@ -94,6 +95,7 @@ class RecurrentSAC(OffPolicyAlgorithm):
         ent_coef: str | float = "auto",
         target_update_interval: int = 1,
         target_entropy: str | float = "auto",
+        max_grad_norm: float = 10.0,
         segment_len: int = 50,
         overlap: int = 10,
         burn_in: int = 10,
@@ -146,6 +148,7 @@ class RecurrentSAC(OffPolicyAlgorithm):
         self.ent_coef = ent_coef
         self.target_entropy = target_entropy
         self.target_update_interval = target_update_interval
+        self.max_grad_norm = max_grad_norm
         self.log_ent_coef: th.Tensor | None = None
         self.ent_coef_optimizer: th.optim.Adam | None = None
 
@@ -371,7 +374,10 @@ class RecurrentSAC(OffPolicyAlgorithm):
 
         self.policy.set_training_mode(True)
 
-        optimizers = [self.policy.actor.optimizer, self.policy.critic.optimizer]
+        q_optimizers = [
+            getattr(self.policy.critic, f"q_optimizer_{i}") for i in range(self.policy.n_critics)
+        ]
+        optimizers = [self.policy.actor.optimizer, *q_optimizers]
         if self.ent_coef_optimizer is not None:
             optimizers.append(self.ent_coef_optimizer)
         self._update_learning_rate(optimizers)
@@ -393,8 +399,12 @@ class RecurrentSAC(OffPolicyAlgorithm):
             dones = replay_data.dones  # (B, T, 1)
             buffer_mask = replay_data.mask  # (B, T, 1)
 
-            # Initial LSTM states for each chunk (from stored or zeros if not store_state)
-            if self.store_state:
+            # Initial LSTM states for each chunk.
+            # For the shared_state=True case, both actor and critic use the actor LSTM,
+            # so stored states are meaningful.  For the non-shared case the critic has its
+            # own LSTM (always zero-initialised), so we zero-initialise the actor as well
+            # to keep both networks in a consistent state during training.
+            if self.store_state and self.shared_state:
                 h0 = replay_data.hidden_states.contiguous()  # (n_layers, B, hidden)
                 c0 = replay_data.cell_states.contiguous()  # (n_layers, B, hidden)
             else:
@@ -402,19 +412,27 @@ class RecurrentSAC(OffPolicyAlgorithm):
                 h0 = th.zeros(shape, device=self.device)
                 c0 = th.zeros(shape, device=self.device)
 
-            # episode_starts for current obs [0..T-1]: reset LSTM at episode boundaries
-            # episode_starts[:, 0] = 0 (continue from stored state)
-            # episode_starts[:, t] = dones[:, t-1] for t > 0
-            ep_starts_curr = th.zeros(B, T, device=self.device)
-            ep_starts_curr[:, 1:] = dones[:, :-1, 0]
-            ep_starts_curr_flat = ep_starts_curr.reshape(B * T)  # (B*T,)
+            # episode_starts for each of the T+1 positions in the observation sequence:
+            #   position 0     → 0 (LSTM continues from stored/zero state)
+            #   position t ≥ 1 → dones[:, t-1] (episode boundary before this obs)
+            ep_starts_all = th.zeros(B, T + 1, device=self.device)
+            ep_starts_all[:, 1:] = dones[:, :, 0]
+            ep_starts_all_flat = ep_starts_all.reshape(B * (T + 1))
 
-            # episode_starts for next obs [1..T]: dones[:, t] signals reset before next obs t
-            ep_starts_next = dones[:, :, 0].reshape(B * T)  # (B*T,)
+            # Convenience slices reused for the non-shared critic
+            ep_starts_curr_flat = ep_starts_all[:, :T].reshape(B * T)
+            ep_starts_next_flat = ep_starts_all[:, 1:].reshape(B * T)
+            obs_curr_flat = obs_all[:, :T].reshape(B * T, *obs_all.shape[2:])
+            obs_next_flat = obs_all[:, 1:].reshape(B * T, *obs_all.shape[2:])
 
-            # Flatten obs for LSTM processing
-            obs_curr_flat = obs_all[:, :T].reshape(B * T, *obs_all.shape[2:])  # (B*T, obs_dim)
-            obs_next_flat = obs_all[:, 1:].reshape(B * T, *obs_all.shape[2:])  # (B*T, obs_dim)
+            # ── Single LSTM pass over all T+1 observations (matches the reference) ───
+            # The actor LSTM sees [obs_0, obs_1, …, obs_T] in one forward pass.
+            # Slicing gives consistent current and next latents on the same trajectory.
+            obs_all_flat = obs_all.reshape(B * (T + 1), *obs_all.shape[2:])
+            lstm_out_all, _ = self.policy.actor.get_lstm_latent(obs_all_flat, (h0, c0), ep_starts_all_flat)
+            lstm_out_all_seq = lstm_out_all.reshape(B, T + 1, -1)
+            lstm_curr_flat = lstm_out_all_seq[:, :T].reshape(B * T, -1)  # h after obs_t   (t=0..T-1)
+            lstm_next_flat = lstm_out_all_seq[:, 1:].reshape(B * T, -1)  # h after obs_t+1 (t=1..T)
 
             # Compute entropy coefficient
             if self.ent_coef_optimizer is not None and self.log_ent_coef is not None:
@@ -425,15 +443,15 @@ class RecurrentSAC(OffPolicyAlgorithm):
             if self.use_sde:
                 self.policy.actor.reset_noise()
 
-            # ── Actor forward on current obs (for ent_coef and actor losses) ──────────
-            curr_actions, log_prob, _ = self.policy.actor.action_log_prob(obs_curr_flat, (h0, c0), ep_starts_curr_flat)
+            # ── Actor MLP on current latent (for ent_coef and actor losses) ──────────
+            curr_actions, log_prob = self.policy.actor.actions_log_prob_from_latent(lstm_curr_flat)
             log_prob = log_prob.reshape(B, T, 1)
 
             # ── Entropy coefficient update ─────────────────────────────────────────────
             ent_coef_loss = None
             if self.ent_coef_optimizer is not None and self.log_ent_coef is not None:
-                ent_coef_loss = -(self.log_ent_coef * (log_prob + self.target_entropy).detach())
-                ent_coef_loss = self._masked_mean(ent_coef_loss, buffer_mask, burn_in)
+                # Unmasked mean matches the reference: log_alpha * mean(entropy - target_entropy)
+                ent_coef_loss = -(self.log_ent_coef * (log_prob + self.target_entropy).detach()).mean()
                 ent_coef_losses.append(ent_coef_loss.item())
             ent_coefs.append(ent_coef.item())
 
@@ -444,26 +462,22 @@ class RecurrentSAC(OffPolicyAlgorithm):
 
             # ── Target Q computation ───────────────────────────────────────────────────
             with th.no_grad():
-                # Actor on next obs (same initial state approximation; burn-in corrects transient error)
-                next_actions, next_log_prob, _ = self.policy.actor.action_log_prob(obs_next_flat, (h0, c0), ep_starts_next)
+                # Next actions from the already-computed next LSTM latent
+                next_actions, next_log_prob = self.policy.actor.actions_log_prob_from_latent(lstm_next_flat)
                 next_log_prob = next_log_prob.reshape(B, T, 1)
 
                 next_acts_flat = next_actions  # (B*T, act_dim)
 
                 if self.shared_state:
-                    # Critic uses raw actor LSTM output (before actor MLP) as state representation.
-                    # Re-run actor LSTM on next obs to get the raw LSTM latent.
-                    from sb3_contrib.rsac.policies import _process_sequence
-
-                    next_features = self.policy.actor.extract_features(obs_next_flat, self.policy.actor.features_extractor)
-                    next_latent, _ = _process_sequence(next_features, (h0, c0), ep_starts_next, self.policy.actor.lstm)
-                    # Target critic: feedforward from raw LSTM output
-                    next_q_values, _ = self.policy.critic_target(next_latent, next_acts_flat)
+                    # Target critic takes raw actor LSTM output as state representation
+                    next_q_values, _ = self.policy.critic_target(lstm_next_flat, next_acts_flat)
                 else:
-                    # Target critic has its own LSTM; initialize from zeros (burn-in recovers)
+                    # Each Q in the target critic has its own LSTM; zero-init, burn-in recovers.
                     h0_c = th.zeros_like(h0)
                     c0_c = th.zeros_like(c0)
-                    next_q_values, _ = self.policy.critic_target(obs_next_flat, next_acts_flat, (h0_c, c0_c), ep_starts_next)
+                    next_q_values, _ = self.policy.critic_target(
+                        obs_next_flat, next_acts_flat, (h0_c, c0_c), ep_starts_next_flat
+                    )
 
                 next_q_values_cat = th.cat(next_q_values, dim=-1).reshape(B, T, -1)
                 next_q_min, _ = th.min(next_q_values_cat, dim=-1, keepdim=True)  # (B, T, 1)
@@ -473,43 +487,34 @@ class RecurrentSAC(OffPolicyAlgorithm):
             acts_flat = acts.reshape(B * T, -1)
 
             if self.shared_state:
-                # Critic uses raw actor LSTM output (detached) as state representation.
-                from sb3_contrib.rsac.policies import _process_sequence
-
-                with th.no_grad():
-                    curr_features = self.policy.actor.extract_features(obs_curr_flat, self.policy.actor.features_extractor)
-                    curr_latent, _ = _process_sequence(curr_features, (h0, c0), ep_starts_curr_flat, self.policy.actor.lstm)
-                current_q_values, _ = self.policy.critic(curr_latent.detach(), acts_flat)
+                # Critic receives actor LSTM latent (detached — no gradient into actor LSTM here)
+                current_q_values, _ = self.policy.critic(lstm_curr_flat.detach(), acts_flat)
             else:
                 h0_c = th.zeros_like(h0)
                 c0_c = th.zeros_like(c0)
                 current_q_values, _ = self.policy.critic(obs_curr_flat, acts_flat, (h0_c, c0_c), ep_starts_curr_flat)
 
+            # Separate backward per Q-head — matches the reference's independent
+            # Q1_summarizer_optimizer / Q1_optimizer / Q2_summarizer_optimizer / Q2_optimizer steps.
             current_q_flat_list = [q.reshape(B, T, 1) for q in current_q_values]
-            critic_loss = sum(
-                self._masked_mean((q - target_q) ** 2 * 0.5, buffer_mask, burn_in)  # type: ignore[arg-type]
-                for q in current_q_flat_list
-            )
-            critic_losses.append(critic_loss.item())
-
-            self.policy.critic.optimizer.zero_grad()
-            critic_loss.backward()
-            self.policy.critic.optimizer.step()
+            critic_loss_total = 0.0
+            for i, (q_pred, q_opt) in enumerate(zip(current_q_flat_list, q_optimizers)):
+                q_loss = self._masked_mean((q_pred - target_q) ** 2, buffer_mask, burn_in)
+                q_opt.zero_grad()
+                # retain_graph for all but the last Q (features may be shared)
+                q_loss.backward(retain_graph=(i < self.policy.n_critics - 1))
+                nn.utils.clip_grad_norm_(self.policy.critic._q_params(i), self.max_grad_norm)
+                q_opt.step()
+                critic_loss_total += q_loss.item()
+            critic_losses.append(critic_loss_total)
 
             # ── Actor update ──────────────────────────────────────────────────────────
+            # lstm_curr_flat already has grad; no need to re-run the LSTM.
             curr_actions_flat = curr_actions  # (B*T, act_dim)
 
             if self.shared_state:
-                # Actor loss: run actor LSTM with gradient; critic uses the raw LSTM latent
-                # (detached from state path) plus the new actions (with gradient).
-                from sb3_contrib.rsac.policies import _process_sequence
-
-                curr_features_grad = self.policy.actor.extract_features(obs_curr_flat, self.policy.actor.features_extractor)
-                curr_latent_grad, _ = _process_sequence(
-                    curr_features_grad, (h0, c0), ep_starts_curr_flat, self.policy.actor.lstm
-                )
-                # Critic receives the state (detached) + new actions (with gradient)
-                q_pi_values, _ = self.policy.critic(curr_latent_grad.detach(), curr_actions_flat)
+                # Critic takes actor LSTM state (detached) + new actions (with grad)
+                q_pi_values, _ = self.policy.critic(lstm_curr_flat.detach(), curr_actions_flat)
             else:
                 h0_c = th.zeros_like(h0)
                 c0_c = th.zeros_like(c0)
@@ -523,6 +528,7 @@ class RecurrentSAC(OffPolicyAlgorithm):
 
             self.policy.actor.optimizer.zero_grad()
             actor_loss.backward()
+            nn.utils.clip_grad_norm_(self.policy.actor.parameters(), self.max_grad_norm)
             self.policy.actor.optimizer.step()
 
             # ── Target network update ─────────────────────────────────────────────────
@@ -578,7 +584,9 @@ class RecurrentSAC(OffPolicyAlgorithm):
         return super()._excluded_save_params() + ["_last_lstm_states"]  # noqa: RUF005
 
     def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
-        state_dicts = ["policy", "policy.actor.optimizer", "policy.critic.optimizer"]
+        state_dicts = ["policy", "policy.actor.optimizer"]
+        for i in range(self.policy.n_critics):
+            state_dicts.append(f"policy.critic.q_optimizer_{i}")
         if self.ent_coef_optimizer is not None:
             state_dicts.append("ent_coef_optimizer")
             return state_dicts, ["log_ent_coef"]
