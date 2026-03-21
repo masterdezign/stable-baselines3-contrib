@@ -364,6 +364,18 @@ class RecurrentCritic(BaseModel):
             self.add_module(f"qf{i}", qf)
             self.q_networks.append(qf)
 
+    def _q_params(self, i: int) -> list:
+        """Parameters exclusively owned by Q-head i (its LSTM if any, plus its MLP).
+
+        Used to build per-Q optimizers that match the reference implementation's
+        separate Q1_summarizer_optimizer / Q1_optimizer / Q2_summarizer_optimizer /
+        Q2_optimizer structure.
+        """
+        params: list = list(self.q_networks[i].parameters())
+        if self.lstm_list is not None:
+            params = list(self.lstm_list[i].parameters()) + params
+        return params
+
     def forward(
         self,
         obs_or_latent: th.Tensor,
@@ -507,11 +519,18 @@ class RecurrentSACPolicy(BasePolicy):
 
         # Critic has its own separate features extractor
         self.critic = self.make_critic(features_extractor=None)
-        self.critic.optimizer = self.optimizer_class(  # type: ignore[call-arg]
-            self.critic.parameters(),
-            lr=lr_schedule(1),
-            **self.optimizer_kwargs,
-        )
+        # Per-Q optimizers: one Adam per Q-head covering its LSTM (if any) + MLP.
+        # Matches the reference's separate Q1_summarizer_optimizer / Q1_optimizer /
+        # Q2_summarizer_optimizer / Q2_optimizer.
+        for i in range(self.n_critics):
+            opt = self.optimizer_class(  # type: ignore[call-arg]
+                self.critic._q_params(i),
+                lr=lr_schedule(1),
+                **self.optimizer_kwargs,
+            )
+            setattr(self.critic, f"q_optimizer_{i}", opt)
+        # Alias kept for LR-schedule updates and backward compatibility
+        self.critic.optimizer = self.critic.q_optimizer_0  # type: ignore[attr-defined]
 
         self.critic_target = self.make_critic(features_extractor=None)
         self.critic_target.load_state_dict(self.critic.state_dict())

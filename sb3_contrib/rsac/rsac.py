@@ -374,7 +374,10 @@ class RecurrentSAC(OffPolicyAlgorithm):
 
         self.policy.set_training_mode(True)
 
-        optimizers = [self.policy.actor.optimizer, self.policy.critic.optimizer]
+        q_optimizers = [
+            getattr(self.policy.critic, f"q_optimizer_{i}") for i in range(self.policy.n_critics)
+        ]
+        optimizers = [self.policy.actor.optimizer, *q_optimizers]
         if self.ent_coef_optimizer is not None:
             optimizers.append(self.ent_coef_optimizer)
         self._update_learning_rate(optimizers)
@@ -447,8 +450,8 @@ class RecurrentSAC(OffPolicyAlgorithm):
             # ── Entropy coefficient update ─────────────────────────────────────────────
             ent_coef_loss = None
             if self.ent_coef_optimizer is not None and self.log_ent_coef is not None:
-                ent_coef_loss = -(self.log_ent_coef * (log_prob + self.target_entropy).detach())
-                ent_coef_loss = self._masked_mean(ent_coef_loss, buffer_mask, burn_in)
+                # Unmasked mean matches the reference: log_alpha * mean(entropy - target_entropy)
+                ent_coef_loss = -(self.log_ent_coef * (log_prob + self.target_entropy).detach()).mean()
                 ent_coef_losses.append(ent_coef_loss.item())
             ent_coefs.append(ent_coef.item())
 
@@ -491,17 +494,19 @@ class RecurrentSAC(OffPolicyAlgorithm):
                 c0_c = th.zeros_like(c0)
                 current_q_values, _ = self.policy.critic(obs_curr_flat, acts_flat, (h0_c, c0_c), ep_starts_curr_flat)
 
+            # Separate backward per Q-head — matches the reference's independent
+            # Q1_summarizer_optimizer / Q1_optimizer / Q2_summarizer_optimizer / Q2_optimizer steps.
             current_q_flat_list = [q.reshape(B, T, 1) for q in current_q_values]
-            critic_loss = sum(
-                self._masked_mean((q - target_q) ** 2 * 0.5, buffer_mask, burn_in)  # type: ignore[arg-type]
-                for q in current_q_flat_list
-            )
-            critic_losses.append(critic_loss.item())
-
-            self.policy.critic.optimizer.zero_grad()
-            critic_loss.backward()
-            nn.utils.clip_grad_norm_(self.policy.critic.parameters(), self.max_grad_norm)
-            self.policy.critic.optimizer.step()
+            critic_loss_total = 0.0
+            for i, (q_pred, q_opt) in enumerate(zip(current_q_flat_list, q_optimizers)):
+                q_loss = self._masked_mean((q_pred - target_q) ** 2, buffer_mask, burn_in)
+                q_opt.zero_grad()
+                # retain_graph for all but the last Q (features may be shared)
+                q_loss.backward(retain_graph=(i < self.policy.n_critics - 1))
+                nn.utils.clip_grad_norm_(self.policy.critic._q_params(i), self.max_grad_norm)
+                q_opt.step()
+                critic_loss_total += q_loss.item()
+            critic_losses.append(critic_loss_total)
 
             # ── Actor update ──────────────────────────────────────────────────────────
             # lstm_curr_flat already has grad; no need to re-run the LSTM.
@@ -579,7 +584,9 @@ class RecurrentSAC(OffPolicyAlgorithm):
         return super()._excluded_save_params() + ["_last_lstm_states"]  # noqa: RUF005
 
     def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
-        state_dicts = ["policy", "policy.actor.optimizer", "policy.critic.optimizer"]
+        state_dicts = ["policy", "policy.actor.optimizer"]
+        for i in range(self.policy.n_critics):
+            state_dicts.append(f"policy.critic.q_optimizer_{i}")
         if self.ent_coef_optimizer is not None:
             state_dicts.append("ent_coef_optimizer")
             return state_dicts, ["log_ent_coef"]
