@@ -374,9 +374,7 @@ class RecurrentSAC(OffPolicyAlgorithm):
 
         self.policy.set_training_mode(True)
 
-        q_optimizers = [
-            getattr(self.policy.critic, f"q_optimizer_{i}") for i in range(self.policy.n_critics)
-        ]
+        q_optimizers = [getattr(self.policy.critic, f"q_optimizer_{i}") for i in range(self.policy.n_critics)]
         optimizers = [self.policy.actor.optimizer, *q_optimizers]
         if self.ent_coef_optimizer is not None:
             optimizers.append(self.ent_coef_optimizer)
