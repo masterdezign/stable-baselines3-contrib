@@ -285,7 +285,7 @@ model = RecurrentSAC(
     overlap={overlap},
     burn_in={p['burn_in']},
     shared_state=True,
-    buffer_size=200_000,
+    buffer_size=100_000,
     policy_kwargs={{
         "net_arch": {net_arch},
         "lstm_hidden_size": {p['lstm_hidden_size']},
