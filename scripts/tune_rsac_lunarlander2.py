@@ -271,18 +271,18 @@ def print_results(study: optuna.Study) -> None:
     print(f"{'=' * 65}")
     p = best.params
     ua = best.user_attrs
-    net_arch = ua.get("net_arch", [256, 256])
+    net_arch = ua.get("net_arch", [128, 128])
     overlap = ua.get("overlap", p.get("segment_len", 32) // 4)
     print(
         f"""
 model = RecurrentSAC(
     "MlpLstmPolicy",
     env,
-    learning_rate={p['learning_rate']:.2e},
-    gamma={p['gamma']},
-    tau={p['tau']},
-    batch_size={p['batch_size']},
-    ent_coef={repr(p['ent_coef'])},
+    learning_rate=3e-4,
+    gamma=0.99,
+    tau=0.005,
+    batch_size=256,
+    ent_coef="auto",
     train_freq=4,
     gradient_steps={p['gradient_steps']},
     segment_len={p['segment_len']},
