@@ -58,7 +58,7 @@ def run(args: argparse.Namespace) -> None:
         overlap=10,
         burn_in=4,
         shared_state=True,
-        buffer_size=100_000,
+        buffer_size=1_000_000,
         policy_kwargs={
             "net_arch": [128, 128, 128],
             "lstm_hidden_size": 64,
