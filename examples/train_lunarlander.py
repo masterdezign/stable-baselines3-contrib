@@ -221,8 +221,7 @@ def train(args: argparse.Namespace) -> Path:
     train_env = make_venv(n_envs=args.n_envs, seed=args.seed)
     eval_env = make_eval_venv(seed=args.seed + 1000)
 
-    # The best hyperparameters from 30 optuna trials with 300k timesteps budget
-    # each
+    # Best hyperparameters from Optuna (tune_rsac_lunarlander2.py, 1M budget/trial)
     model = RecurrentSAC(
         "MlpLstmPolicy",
         train_env,
@@ -234,14 +233,14 @@ def train(args: argparse.Namespace) -> Path:
         train_freq=4,
         gradient_steps=8,
         segment_len=32,
-        overlap=11,
-        burn_in=0,
+        overlap=10,
+        burn_in=4,
         shared_state=True,
         buffer_size=100_000,
         policy_kwargs={
-            "net_arch": [128, 128],
+            "net_arch": [128, 128, 128],
             "lstm_hidden_size": 64,
-            "n_lstm_layers": 1,
+            "n_lstm_layers": 2,
         },
         verbose=0,
         seed=args.seed,
@@ -396,7 +395,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=["train", "plot", "both"], default="both")
     parser.add_argument("--run-dir", type=str, default=_default_run_dir(), help="Output directory")
     parser.add_argument("--total-timesteps", type=int, default=5_000_000)
-    parser.add_argument("--n-envs", type=int, default=4)
+    parser.add_argument("--n-envs", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--log-freq",
